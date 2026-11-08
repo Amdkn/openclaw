@@ -33,6 +33,7 @@ import { isScopelessNodePairingRequest } from "../../node-pairing-auto-approve.j
 import {
   openclawIdPeerKeyOf,
   recordDeviceTokenPeer,
+  recordTokenlessOpenClawIdOperator,
 } from "../../openclaw-id/device-token-binding.js";
 import { normalizeChromeExtensionOrigin } from "../../origin-check.js";
 import { broadcastRejectedDevicePairing } from "../../pairing-events.js";
@@ -628,6 +629,10 @@ export async function authorizeGatewayConnectDevice(
           peerKey: issuedPeerKey,
         });
       }
+    }
+    if (role === "operator" && !deviceToken) {
+      // Lanes that issue no token still mark the browser as managed on the Access page.
+      await recordTokenlessOpenClawIdOperator(state.device.id, issuedPeerKey);
     }
   }
   context.recordAttachTiming?.("deviceTokensMs", tokensStartedAt);
