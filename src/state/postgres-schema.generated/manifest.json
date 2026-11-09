@@ -428,6 +428,18 @@
       "file": "fragment-worktree_templates.postgres.sql"
     },
     {
+      "id": "worktree_template_manifests",
+      "tables": [
+        "worktree_template_manifests"
+      ],
+      "indexes": [],
+      "dependencies": [
+        "worktree_templates"
+      ],
+      "activation": "version-additive",
+      "file": "fragment-worktree_template_manifests.postgres.sql"
+    },
+    {
       "id": "user_preferences",
       "tables": [
         "user_preferences"

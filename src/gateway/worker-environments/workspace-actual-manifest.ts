@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants, realpathSync, type BigIntStats, type Dirent } from "node:fs";
+import { constants, realpathSync, type BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readFileWindowFully } from "@openclaw/fs-safe/advanced";
@@ -203,11 +203,11 @@ export async function scanActualWorkspaceManifest(
     // Only repair candidates authenticated against a saved root may retain this former input.
     includeLegacyPnpmStore?: boolean;
     unchangedProbe?: boolean;
-    // Return only an accepted baseline node whose exact file identity still matches.
+    // The caller proves content reuse through file identity or immutable template custody.
     reuseFile?: (
       entryPath: string,
       identity: string,
-      stats: Pick<BigIntStats, "dev" | "ino" | "size" | "ctimeNs">,
+      stats: Pick<BigIntStats, "dev" | "ino" | "size" | "ctimeNs" | "mode">,
     ) => Extract<WorkerWorkspaceManifestEntry, { type: "file" }> | undefined;
   },
 ): Promise<void> {
@@ -281,7 +281,6 @@ export async function scanActualWorkspaceManifest(
   };
   const filePaths: string[] = [];
   const hashContext = activeWorkspaceHashContext();
-  const freshCapture = !params.reuseFile && !hashContext?.memo.size && !params.unchangedProbe;
   const scanConcurrency = 4;
   const discoveryBatchSize = 32;
   // Nested discovery batches must not replace their first failure with a later caller abort.
@@ -430,20 +429,13 @@ export async function scanActualWorkspaceManifest(
     const absoluteDirectory = relativeDirectory ? path.join(root, relativeDirectory) : root;
     let hasDerivedEntry = false;
     let hasNonDerivedEntry = false;
-    const batch: Dirent[] = [];
+    const batch: string[] = [];
     const scanBatch = async () => {
       const directories: Array<string | undefined> = [];
       await runScans(0, batch.length, async (index) => {
-        const entry = batch[index]!;
-        const relative = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+        const relative = batch[index]!;
         if (await isExcluded(relative)) {
           hasDerivedEntry = true;
-          return;
-        }
-        if (freshCapture && entry.isFile()) {
-          // The opened-file reader owns type, containment, identity, and byte limits.
-          hasNonDerivedEntry = true;
-          filePaths.push(relative);
           return;
         }
         const absolute = path.join(root, relative);
@@ -479,7 +471,7 @@ export async function scanActualWorkspaceManifest(
       if (!relativeDirectory && name === ".git") {
         continue;
       }
-      batch.push(directoryEntry);
+      batch.push(relative);
       if (batch.length === discoveryBatchSize) {
         await scanBatch();
       }
@@ -534,11 +526,13 @@ export async function scanActualWorkspaceManifest(
 
 export async function readActualWorkspaceManifestImpl(
   params: ActualWorkspaceManifestOptions,
+  reuseFile?: Parameters<typeof scanActualWorkspaceManifest>[0]["reuseFile"],
 ): Promise<{ manifest: WorkerWorkspaceManifest; manifestRef: string; rawManifest: string }> {
   const entries: WorkerWorkspaceManifestEntry[] = [];
   const directories: string[] = [];
   await scanActualWorkspaceManifest({
     ...params,
+    reuseFile,
     onEntry(entry) {
       if (entry.type === "directory") {
         directories.push(entry.path);

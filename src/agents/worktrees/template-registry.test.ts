@@ -88,6 +88,7 @@ it("reads absent templates without writer queueing and recovers on the first mut
   await fs.copyFile(`${databasePath}.template`, databasePath, fs.constants.COPYFILE_EXCL);
   const { DatabaseSync } = requireNodeSqlite();
   const older = new DatabaseSync(databasePath);
+  older.exec("DROP TABLE IF EXISTS worktree_template_manifests");
   older.exec("DROP TABLE IF EXISTS worktree_templates");
   older.close();
 
@@ -136,6 +137,52 @@ it("reads absent templates without writer queueing and recovers on the first mut
     expect(await list()).toEqual([published(replacement, 40)]);
     await waitForDiagnosticEventsDrained();
     expect(new Set(readerQueues)).toEqual(new Set(["stateRead"]));
+  });
+});
+
+it("binds cached manifests to the generation, commit and policy until template retirement", async () => {
+  const key = { id: template.id, sourceCommit: template.sourceCommit, policyKey: "source-v1" };
+  const document = { rawManifest: '{"entries":[]}', manifestRef: "sha256:synthetic" };
+  const cached = (input = key) => registry.readTemplateManifestAsync(env, input, guard);
+  await withoutMainThreadSql(async () => {
+    expect(await cached()).toBeUndefined();
+    await reserve();
+    await registry.writeTemplateManifestAsync(env, { ...key, ...document }, guard);
+    expect(await cached()).toEqual(document);
+    for (const mismatch of [
+      { id: "other" },
+      { sourceCommit: "b".repeat(40) },
+      { policyKey: "other" },
+    ]) {
+      expect(await cached({ ...key, ...mismatch })).toBeUndefined();
+    }
+    await expect(
+      registry.writeTemplateManifestAsync(
+        env,
+        {
+          ...key,
+          ...document,
+          sourceCommit: "b".repeat(40),
+        },
+        guard,
+      ),
+    ).rejects.toThrow("generation changed");
+    await expect(
+      worker(undefined, true).run((scope) =>
+        scope.execute({
+          type: "worktrees.templates.manifest.write",
+          input: { ...key, ...document, rawManifest: "revoked" },
+        }),
+      ),
+    ).rejects.toThrow("allocation lease lost");
+    expect(await cached()).toEqual(document);
+    const replacement = { ...key, policyKey: "source-v2" };
+    await registry.writeTemplateManifestAsync(env, { ...replacement, ...document }, guard);
+    expect(await cached()).toBeUndefined();
+    expect(await cached(replacement)).toEqual(document);
+    await remove(template.id);
+    await reserve();
+    expect(await cached(replacement)).toBeUndefined();
   });
 });
 

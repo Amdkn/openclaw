@@ -614,7 +614,13 @@ This change requires no schema migration. See the
 
 The worktree service owns template creation, reuse, invalidation, and cleanup under a mutation lease for each template cache key. It reserves a `preparing` row before creating the artifact and publishes `ready` only after preparation completes. Persisted readers retain the generation while checkouts clone independently; cleanup and replacement defer while readers remain. Durable mutations recheck custody inside synchronous state transactions; filesystem work runs outside those transactions. Cleanup uses the reserved template ID so an old operation cannot delete its replacement. Templates are replaced when the commit or checkout policy changes and retired after seven days without use.
 
-The additive table is created if missing on first use and does not change the numeric database schema version. Existing worktree and snapshot records retain their meaning; no existing checkout is migrated or moved. Template artifacts are reconstructible, while registered worktree contents and recovery snapshots retain their existing preservation rules.
+Sandbox templates also retain one zstd-compressed content manifest per generation in
+`worktree_template_manifests`. The source commit and path policy select reuse;
+a different policy replaces the generation's derived document. Template deletion
+cascades to its manifest. Publication uses the existing template worker and
+custody; compression and filesystem capture occur outside the write transaction.
+
+Both additive tables are created if missing on first use and do not change the numeric database schema version. Existing worktree and snapshot records retain their meaning; no existing checkout is migrated or moved. Template artifacts and manifests are reconstructible, while registered worktree contents and recovery snapshots retain their existing preservation rules.
 
 ### Conversation environments
 

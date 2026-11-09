@@ -110,6 +110,15 @@ back and forth. Every build still passes disk admission. Live clone and installe
 readers can temporarily retain additional generations; cleanup never removes
 their files before those readers settle.
 
+Each private dependency-template generation retains a compressed content manifest
+for its selected commit and build-cache path policy. A matching preparation uses
+that manifest instead of hashing the cloned source again. Commit refreshes reuse
+unchanged file hashes from the previous generation using Git's source delta;
+metadata discovery still records empty directories and changed input markers.
+Missing manifests or changed checkout attributes use a full capture. Canonical
+workspace edits are reconciled separately, so cached template contents never
+replace authored changes. The manifest is deleted with its template generation.
+
 Older runtime identities become eligible for cleanup after six unused hours.
 The most recently used identity keeps the ordinary idle retention window, subject
 to the four-generation limit. Hourly maintenance shares the existing deletion

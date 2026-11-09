@@ -403,9 +403,15 @@ assert(["timing", "allocation", "retention"].includes(values.instrument!));
 const retentionMs = Number(values["retention-ms"]);
 assert(Number.isSafeInteger(retentionMs) && retentionMs >= 0);
 const workers = new Set<Worker>();
+let workerStarts = 0,
+  workerExits = 0;
 const observeWorker = (worker: Worker) => {
+  workerStarts++;
   workers.add(worker);
-  worker.once("exit", () => workers.delete(worker));
+  worker.once("exit", () => {
+    workerExits++;
+    workers.delete(worker);
+  });
 };
 if (values.instrument === "retention" || serialTurns) {
   if (values.instrument === "retention") {
@@ -413,6 +419,22 @@ if (values.instrument === "retention" || serialTurns) {
   }
   process.on("worker", observeWorker);
 }
+const sampleWorkerAllocation = async () => {
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    return await Promise.all(
+      [...workers].map(async (worker) => ({
+        threadId: worker.threadId,
+        bytes: await worker.getHeapStatistics().then(
+          (stats) => stats.total_allocated_bytes,
+          () => null,
+        ),
+      })),
+    );
+  } finally {
+    clearInterval(keepAlive);
+  }
+};
 const collectRetainedMemory = async () => {
   assert(globalThis.gc, "Retention samples require --expose-gc");
   // Worker inspection promises do not retain the event loop after these pools unref their workers.
@@ -454,6 +476,9 @@ if (values["agent-db-fixture"]) {
     "openclaw-agent.sqlite",
   );
   fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const { prepareSqliteDatabaseDirectory } =
+    await import("../../src/infra/sqlite-wal-filesystem.js");
+  prepareSqliteDatabaseDirectory(destination);
   fs.copyFileSync(
     path.resolve(values["agent-db-fixture"]),
     destination,
@@ -1274,6 +1299,17 @@ measurement: try {
     const measureTurn = async (phase: string, prepare = prepareWorkspace) => {
       acquisitions = scans = probes = 0;
       manifestReads.length = 0;
+      const workerStartsBefore = workerStarts,
+        workerExitsBefore = workerExits;
+      const workerAllocationBefore =
+        values.instrument === "allocation" ? await sampleWorkerAllocation() : undefined;
+      const gitOperations: Record<string, number> = {};
+      const gitDiagnostics = channel("openclaw.git.operation");
+      const observeGitOperation = (message: unknown) => {
+        const { operation } = message as { operation: string };
+        gitOperations[operation] = (gitOperations[operation] ?? 0) + 1;
+      };
+      gitDiagnostics.subscribe(observeGitOperation);
       const physicalBefore = snapshotSqliteReaderMetrics();
       const spans: Record<string, { count: number; totalMs: number }> = {};
       const loop = monitorEventLoopDelay({ resolution: 1 });
@@ -1311,6 +1347,7 @@ measurement: try {
         },
         () => withWorktreePreparationTiming("sandbox", prepare),
       ).catch(async (error: unknown) => {
+        gitDiagnostics.unsubscribe(observeGitOperation);
         if (contenderStarted) {
           await Promise.allSettled([contender]);
         }
@@ -1324,6 +1361,7 @@ measurement: try {
         total = process.cpuUsage(totalBefore);
       const allocatedBytes = getHeapStatistics().total_allocated_bytes - allocationBefore;
       loop.disable();
+      gitDiagnostics.unsubscribe(observeGitOperation);
       const readMetrics = snapshotSqliteReaderMetrics().map((metric) => {
         const previous = physicalBefore.find((entry) => entry.operation === metric.operation);
         return {
@@ -1332,6 +1370,9 @@ measurement: try {
           readBytes: metric.readBytes - (previous?.readBytes ?? 0),
         };
       });
+      const workerAllocationAfter = workerAllocationBefore
+        ? await sampleWorkerAllocation()
+        : undefined;
       const result = {
         phase,
         elapsedMs,
@@ -1339,6 +1380,27 @@ measurement: try {
         mainCpuMs: (cpu.user + cpu.system) / 1000,
         processCpuMs: (total.user + total.system) / 1000,
         allocatedBytes,
+        gitOperations,
+        workerAllocation:
+          workerAllocationBefore && workerAllocationAfter
+            ? {
+                before: workerAllocationBefore,
+                after: workerAllocationAfter,
+                started: workerStarts - workerStartsBefore,
+                exited: workerExits - workerExitsBefore,
+                matchedAllocatedBytes: workerAllocationAfter.reduce((sum, after) => {
+                  const before = workerAllocationBefore.find(
+                    (entry) => entry.threadId === after.threadId,
+                  );
+                  return (
+                    sum +
+                    (before?.bytes != null && after.bytes != null ? after.bytes - before.bytes : 0)
+                  );
+                }, 0),
+                accounting:
+                  "Delta covers only workers sampled at both boundaries; new-worker values are lifetime totals. Exited or unavailable workers are unmeasured.",
+              }
+            : undefined,
         eventLoopP99Ms: loop.percentile(99) / 1e6,
         eventLoopMaxMs: loop.max / 1e6,
         eventLoopSamples: loop.count,

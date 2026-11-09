@@ -1898,6 +1898,14 @@ CREATE TABLE IF NOT EXISTS worktree_templates (
   last_used_at INTEGER NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS worktree_template_manifests (
+  template_id TEXT NOT NULL PRIMARY KEY
+    REFERENCES worktree_templates(id) ON DELETE CASCADE,
+  policy_key TEXT NOT NULL,
+  manifest_ref TEXT NOT NULL,
+  manifest_zstd BLOB NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT NOT NULL PRIMARY KEY,
   display_name TEXT NOT NULL,

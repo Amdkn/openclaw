@@ -132,6 +132,31 @@ export function reserveTemplateAsync(
   );
 }
 
+export async function readTemplateManifestAsync(
+  env: NodeJS.ProcessEnv,
+  input: { id: string; sourceCommit: string; policyKey: string },
+  commitGuard: () => void,
+): Promise<{ rawManifest: string; manifestRef: string } | undefined> {
+  const reply = await runTemplateReadCommand(
+    env,
+    { type: "worktrees.templates.manifest.read", input },
+    commitGuard,
+  );
+  return reply?.manifest;
+}
+
+export function writeTemplateManifestAsync(
+  env: NodeJS.ProcessEnv,
+  input: OpenClawStateWorkerOperations["worktrees.templates.manifest.write"]["input"],
+  commitGuard: () => void,
+): Promise<void> {
+  return runTemplateCommand(
+    env,
+    { type: "worktrees.templates.manifest.write", input },
+    commitGuard,
+  );
+}
+
 export function markTemplateReadyAsync(
   env: NodeJS.ProcessEnv,
   id: string,

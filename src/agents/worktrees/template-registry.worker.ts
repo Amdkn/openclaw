@@ -1,3 +1,4 @@
+import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import type { Selectable } from "kysely";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
@@ -19,13 +20,27 @@ import type {
 } from "../../state/worker-operation-registry.js";
 import { retainedWorktreeTemplateKey, type WorktreeTemplateRecord } from "./template-registry.js";
 
-type TemplateDatabase = Pick<DB, "worktree_templates" | "state_leases">;
+type TemplateDatabase = Pick<
+  DB,
+  "worktree_templates" | "worktree_template_manifests" | "state_leases"
+>;
 const TEMPLATE_READER_SCOPE = "core:managed-worktrees:template-readers";
 const kyselyFor = (db: EngineConnection) => getNodeSqliteKysely<TemplateDatabase>(db);
 const ensureTemplateSchema = createOpenClawStateSchemaEnsurer({
   table: "worktree_templates",
   operationLabel: "agents.worktrees.templates.schema.ensure",
 });
+const ensureTemplateManifestSchema = createOpenClawStateSchemaEnsurer({
+  table: "worktree_template_manifests",
+  operationLabel: "agents.worktrees.templates.manifest.schema.ensure",
+});
+type TemplateManifestInput = {
+  id: string;
+  sourceCommit: string;
+  policyKey: string;
+  rawManifest: string;
+  manifestRef: string;
+};
 
 function rowToRecord(
   row: Selectable<TemplateDatabase["worktree_templates"]>,
@@ -105,6 +120,32 @@ function hasTemplateReaders(db: EngineConnection, id: string): boolean {
 }
 
 export const worktreeTemplateReadOperations = {
+  "worktrees.templates.manifest.read": (
+    input: { id: string; sourceCommit: string; policyKey: string },
+    db,
+  ) => {
+    const row = tableExists(db, "worktree_template_manifests")
+      ? executeSqliteQuerySync(
+          db,
+          kyselyFor(db)
+            .selectFrom("worktree_template_manifests as manifests")
+            .innerJoin("worktree_templates as templates", "templates.id", "manifests.template_id")
+            .select(["manifests.manifest_ref", "manifests.manifest_zstd"])
+            .where("templates.id", "=", input.id)
+            .where("templates.source_commit", "=", input.sourceCommit)
+            .where("manifests.policy_key", "=", input.policyKey),
+        ).rows[0]
+      : undefined;
+    return {
+      type: "worktrees.templates.manifest.read" as const,
+      manifest: row
+        ? {
+            rawManifest: zstdDecompressSync(row.manifest_zstd).toString("utf8"),
+            manifestRef: row.manifest_ref,
+          }
+        : undefined,
+    };
+  },
   "worktrees.templates.read": (
     { cacheKey, contentKey }: { cacheKey: string; contentKey?: string },
     db,
@@ -162,7 +203,52 @@ export const worktreeTemplateReadOperations = {
   }),
 } satisfies WorkerOperationHandlers<EngineConnection>;
 
+const writeTemplateManifest = worktreeTemplateMutation(
+  "worktrees.templates.manifest.write",
+  (db, input: Omit<TemplateManifestInput, "rawManifest"> & { compressed: Uint8Array }) => {
+    const k = kyselyFor(db);
+    if (
+      !executeSqliteQuerySync(
+        db,
+        k
+          .selectFrom("worktree_templates")
+          .select("id")
+          .where("id", "=", input.id)
+          .where("source_commit", "=", input.sourceCommit),
+      ).rows.length
+    ) {
+      throw new Error("Worktree template generation changed before manifest publication");
+    }
+    executeSqliteQuerySync(
+      db,
+      k
+        .insertInto("worktree_template_manifests")
+        .values({
+          template_id: input.id,
+          policy_key: input.policyKey,
+          manifest_ref: input.manifestRef,
+          manifest_zstd: input.compressed,
+        })
+        .onConflict((conflict) =>
+          conflict.column("template_id").doUpdateSet({
+            policy_key: input.policyKey,
+            manifest_ref: input.manifestRef,
+            manifest_zstd: input.compressed,
+          }),
+        ),
+    );
+  },
+);
+
 export const worktreeTemplateOperations = {
+  "worktrees.templates.manifest.write": (
+    { rawManifest, ...input }: TemplateManifestInput,
+    context: WorkerOperationContext,
+  ) => {
+    const compressed = zstdCompressSync(Buffer.from(rawManifest));
+    ensureTemplateManifestSchema(openTemplateDatabase(context));
+    return writeTemplateManifest({ ...input, compressed }, context);
+  },
   "worktrees.templates.reserve": worktreeTemplateMutation(
     "worktrees.templates.reserve",
     (db, record: WorktreeTemplateRecord & { status: "preparing" }) => {

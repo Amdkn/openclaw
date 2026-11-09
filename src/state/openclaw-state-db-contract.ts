@@ -89,6 +89,7 @@ export const LAZY_ADDITIVE_STATE_TABLES = [
   "secret_store_entries",
   "projects",
   "worktree_templates",
+  "worktree_template_manifests",
   "user_preferences",
   "device_pair_setup_completions",
   "github_publication_requests",
