@@ -65,6 +65,8 @@
  * snapshot bytes. Physical SQLite read accounting is Linux-only; unavailable is null.
  * --agent-storage-dir puts only the fixture's agent database on another volume;
  * canonical and projected workspaces remain under --output. Report that topology.
+ * --agent-db-fixture clones a closed, checkpointed synthetic session database before
+ * preparation. Reuse one seed across fresh A/B workspaces; never pass production data.
  * --acceleration --sandbox-backend podman --sandbox-image <local-image> exercises
  * real dependency-template preparation on a supported filesystem. The image must
  * already exist; its offline pnpm install may fail and exercise source-only fallback.
@@ -165,6 +167,7 @@ const { values } = parseArgs({
     "file-bytes": { type: "string", default: "0" },
     "transcript-mib": { type: "string", default: "0" },
     "agent-storage-dir": { type: "string" },
+    "agent-db-fixture": { type: "string" },
     "reuse-fixture": { type: "boolean", default: false },
     report: { type: "string", default: "report.json" },
     port: { type: "string", default: "44984" },
@@ -390,6 +393,7 @@ const fileBytes = Number(values["file-bytes"]);
 assert(Number.isSafeInteger(fileBytes) && fileBytes >= 0);
 const transcriptMiB = Number(values["transcript-mib"]);
 assert(Number.isSafeInteger(transcriptMiB) && transcriptMiB >= 0);
+assert(!values["agent-db-fixture"] || (serialTurns && !transcriptMiB));
 assert(!transcriptMiB || values.mode === "preparation" || fileReads || turnLoop);
 for (const value of [requests, burst, files, port, worktrees]) {
   assert(Number.isSafeInteger(value) && value > 0);
@@ -439,6 +443,22 @@ if (values["agent-storage-dir"] && !reuseFixture) {
   fs.mkdirSync(agentStorage);
   fs.mkdirSync(path.join(output, "state"), { recursive: true });
   fs.symlinkSync(agentStorage, path.join(output, "state", "agents"), "dir");
+}
+if (values["agent-db-fixture"]) {
+  const destination = path.join(
+    output,
+    "state",
+    "agents",
+    "main",
+    "agent",
+    "openclaw-agent.sqlite",
+  );
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(
+    path.resolve(values["agent-db-fixture"]),
+    destination,
+    fs.constants.COPYFILE_FICLONE,
+  );
 }
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const owners = [
@@ -936,7 +956,7 @@ measurement: try {
       await import("../../src/config/sessions/session-accessor.sqlite-entry-store.js");
     agent.runOpenClawAgentWriteTransaction(
       (writer) => {
-        for (let i = 0; i < (transcriptMiB ? 0 : 10_000); i++) {
+        for (let i = 0; i < (transcriptMiB || values["agent-db-fixture"] ? 0 : 10_000); i++) {
           writeSessionEntry(writer, `agent:main:subagent:fixture-${i}`, {
             sessionId: `fixture-${i}`,
             updatedAt: 1,
@@ -1611,6 +1631,7 @@ measurement: try {
         files: inventory.length,
         bytes: initialBytes,
         source: values["fixture-source"] ?? null,
+        agentDatabase: values["agent-db-fixture"] ?? null,
         siblingWorktrees,
         acceleration: values.acceleration,
         headAdvance: values["head-advance"] ?? null,
