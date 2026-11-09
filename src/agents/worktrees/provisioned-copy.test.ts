@@ -1,4 +1,5 @@
-import { constants as fsConstants } from "node:fs";
+import childProcess from "node:child_process";
+import fsSync, { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,7 +35,7 @@ function fixture(destinationParent?: string) {
   };
 }
 
-it.for(["authority", "copy", "cross-filesystem", "revoked", "aborted"])(
+it.for(["authority", "copy", "cross-filesystem", "portable", "revoked", "aborted"])(
   "attributes %s while preserving copy, skip and authority contracts",
   async (blocked, context) => {
     const crossFilesystem = blocked === "cross-filesystem";
@@ -52,10 +53,20 @@ it.for(["authority", "copy", "cross-filesystem", "revoked", "aborted"])(
         context.skip();
       }
     }
+    if (blocked === "portable") {
+      vi.spyOn(childProcess, "execFileSync").mockImplementationOnce(() => {
+        throw Object.assign(new Error("GNU cp unavailable"), { code: "ENOENT" });
+      });
+    }
     let clock = 0;
     vi.spyOn(performance, "now").mockImplementation(() => clock);
     copiedOptions.mockImplementation(async () => {
       clock += blocked === "copy" ? 80 : 0;
+    });
+    const spawn = childProcess.spawn.bind(childProcess);
+    vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
+      clock += blocked === "copy" ? 80 : 0;
+      return spawn(...args);
     });
     const diagnostics: Record<string, number> = {};
     const controller = new AbortController();
@@ -117,17 +128,25 @@ it.for(["authority", "copy", "cross-filesystem", "revoked", "aborted"])(
     assert.isDefined(diagnostics.authorityWaitMs);
     expect(diagnostics.authorityWaitMs).toEqual(blocked === "authority" ? expect.any(Number) : 0);
     expect(diagnostics.copyAwaitMs).toBe(
-      blocked === "authority" ? diagnostics.authorityWaitMs - 160 : blocked === "copy" ? 160 : 0,
+      blocked === "authority"
+        ? diagnostics.authorityWaitMs - (copiedOptions.mock.calls.length ? 160 : 0)
+        : blocked === "copy"
+          ? copiedOptions.mock.calls.length
+            ? 160
+            : 80
+          : 0,
     );
-    expect(copiedOptions.mock.calls[0]?.[0]).toMatchObject({
-      clone: "auto",
-      overwrite: false,
-      preserveSourceMode: true,
-      preserveMetadata: true,
-      sourceHardlinks: "allow",
-      mutationSymlinks: "reject",
-      durable: false,
-    });
+    if (copiedOptions.mock.calls.length) {
+      expect(copiedOptions.mock.calls[0]?.[0]).toMatchObject({
+        clone: "auto",
+        overwrite: false,
+        preserveSourceMode: true,
+        preserveMetadata: true,
+        sourceHardlinks: "allow",
+        mutationSymlinks: "reject",
+        durable: false,
+      });
+    }
     const copied = path.join(destination, "file");
     const [before, after] = await Promise.all([fs.stat(sourceFile), fs.stat(copied)]);
     expect(after.ino).not.toBe(before.ino);
@@ -137,5 +156,114 @@ it.for(["authority", "copy", "cross-filesystem", "revoked", "aborted"])(
     await fs.writeFile(copied, "destination only");
     expect(await fs.readFile(sourceFile, "utf8")).toBe(content);
     expect(await fs.readFile(path.join(destination, "existing"), "utf8")).toBe("user owned");
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "admits a directory once and pins source files and directories across symlink swaps",
+  async () => {
+    const { source, destination } = fixture();
+    const outside = directories.make("provisioned-copy-outside-");
+    await fs.mkdir(path.join(source, "selected"));
+    await fs.mkdir(path.join(source, "skipped"));
+    await fs.writeFile(path.join(outside, "file"), "outside");
+    await fs.symlink(path.join(outside, "file"), path.join(source, "skipped", "link"));
+    const names = Array.from({ length: 32 }, (_, index) => `selected/${index}`);
+    const modified = new Map<string, bigint>();
+    for (const name of names) {
+      await fs.writeFile(path.join(source, name), name);
+      modified.set(name, (await fs.stat(path.join(source, name), { bigint: true })).mtimeNs);
+    }
+    const spawn = childProcess.spawn.bind(childProcess);
+    let swapped = false;
+    vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
+      if (!swapped) {
+        swapped = true;
+        fsSync.renameSync(path.join(source, "selected"), path.join(source, "admitted"));
+        fsSync.symlinkSync(outside, path.join(source, "selected"), "dir");
+        fsSync.renameSync(path.join(source, "admitted", "0"), path.join(source, "original"));
+        fsSync.symlinkSync(path.join(outside, "file"), path.join(source, "admitted", "0"));
+      }
+      return spawn(...args);
+    });
+    const authority = vi.fn();
+    const result = await copyProvisionedPaths(source, destination, [...names, "skipped/link"], {
+      assertCurrent: authority,
+    });
+    expect(authority.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(swapped).toBe(true);
+    expect(result).toEqual(names.toSorted());
+    expect(await fs.readdir(destination)).toEqual(["selected"]);
+    for (const name of names) {
+      expect(await fs.readFile(path.join(destination, name), "utf8")).toBe(name);
+      expect((await fs.stat(path.join(destination, name), { bigint: true })).mtimeNs).toBe(
+        modified.get(name),
+      );
+    }
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "settles an accepted child before rejecting cancellation and starts no more batches",
+  async () => {
+    const { source, destination } = fixture();
+    const names = Array.from({ length: 256 }, (_, index) => `${index}`);
+    for (const name of names) {
+      await fs.writeFile(path.join(source, name), name);
+    }
+    const controller = new AbortController();
+    const failure = new Error("source retired");
+    const started = Promise.withResolvers<childProcess.ChildProcessWithoutNullStreams>();
+    const spawn = childProcess.spawn.bind(childProcess);
+    const copies = vi.spyOn(childProcess, "spawn").mockImplementation(() => {
+      // A real child holds the native section until stdin closes, simulating blocked copy IO.
+      const child = spawn(process.execPath, ["-e", "process.stdin.resume()"], { stdio: "pipe" });
+      started.resolve(child);
+      return child;
+    });
+    let settled = false;
+    const pending = copyProvisionedPaths(source, destination, names, { signal: controller.signal });
+    const rejection = expect(pending).rejects.toBe(failure);
+    void pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    const child = await started.promise;
+    controller.abort(failure);
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(settled).toBe(false);
+    child.stdin.end();
+    await rejection;
+    expect(copies).toHaveBeenCalledTimes(1);
+    expect(await fs.readdir(destination)).toEqual([]);
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "rejects replacement of an admitted root before opening its descriptor",
+  async () => {
+    const { source, destination } = fixture();
+    const retained = directories.make("provisioned-copy-retained-");
+    await fs.writeFile(path.join(source, "file"), "admitted");
+    const open = fs.open.bind(fs);
+    let replaced = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (args[0] === source && !replaced) {
+        replaced = true;
+        await fs.rename(source, retained);
+        await fs.mkdir(source);
+        await fs.writeFile(path.join(source, "file"), "replacement");
+      }
+      return open(...args);
+    });
+    await expect(copyProvisionedPaths(source, destination, ["file"], {})).rejects.toThrow();
+    expect(replaced).toBe(true);
+    expect(await fs.readdir(destination)).toEqual([]);
   },
 );

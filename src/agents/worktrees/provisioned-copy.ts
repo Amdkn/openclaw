@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import type { FsSafeProvisionCopyDiagnostics } from "../../infra/fs-safe-copy-worker-contract.js";
 import { root as fsRoot, FsSafeError, type Root } from "../../infra/fs-safe.js";
 import { lstatIfExists } from "../../infra/path-existence.js";
+import { copyProvisionedPathsLinux } from "./provisioned-copy-linux.js";
 import {
   hasSafeParentDirectories,
   normalizeProvisionedRelativePath,
@@ -122,6 +123,20 @@ export async function copyProvisionedPaths(
     diagnostics.preflightMs = performance.now() - rootsStartedAt;
   }
   const [sourceRoot, destinationRoot] = roots;
+  options.signal?.throwIfAborted();
+  const copyStartedAt = performance.now();
+  try {
+    const linuxCopy = await copyProvisionedPathsLinux(sourceRoot, destinationRoot, paths, {
+      ...options,
+      assertCurrent,
+      diagnostics,
+    });
+    if (linuxCopy) {
+      return linuxCopy;
+    }
+  } finally {
+    diagnostics.copyAwaitMs = performance.now() - copyStartedAt;
+  }
   const provisioned: string[] = [];
   for (const relativePath of paths) {
     const normalized = normalizeProvisionedRelativePath(relativePath);
