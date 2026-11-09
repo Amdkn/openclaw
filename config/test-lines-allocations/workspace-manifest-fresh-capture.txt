@@ -1,0 +1,2 @@
+# Reuse existing capture/error tests to protect the directory-entry fast path.
+13

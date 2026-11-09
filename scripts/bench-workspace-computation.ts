@@ -2,6 +2,8 @@
 // Reconcile additions: --scenarios reconcile --sizes 3000 --changed-files 2000
 // --added-files 2000 --runs 5 --warmup 1. Repeat with --sampling-interval 32768
 // for allocation evidence; keep timing and sampled-allocation runs separate.
+// `scan` runs the manifest reader directly so allocation includes its filesystem work;
+// `manifest` includes the production worker handoff, whose allocations are separate.
 import assert from "node:assert/strict";
 import { createHook, executionAsyncId } from "node:async_hooks";
 import { execFile, fork } from "node:child_process";
@@ -39,6 +41,7 @@ const gitDiagnostics = channel("openclaw.git.operation");
 const scenarios = [
   "inventory",
   "manifest",
+  "scan",
   "delta",
   "unchanged",
   "compare",
@@ -339,7 +342,7 @@ async function createFixture(params: {
           await checkDirtyPages();
         }
       }
-    } else if (scenario === "inventory" || scenario === "manifest") {
+    } else if (scenario === "inventory" || scenario === "manifest" || scenario === "scan") {
       let next = 0;
       await Promise.all(
         Array.from({ length: 32 }, async () => {
@@ -491,12 +494,20 @@ async function childMain(fixturePath: string, reopening: boolean): Promise<void>
           typeof import("../src/gateway/worker-environments/workspace-sync-inventory.js")
         >(fixture.source, "src/gateway/worker-environments/workspace-sync-inventory.ts")
       : undefined;
-  const manifests =
+  const captureManifest =
     fixture.scenario === "manifest"
-      ? await importOwner<
-          typeof import("../src/gateway/worker-environments/workspace-manifest-worker.js")
-        >(fixture.source, "src/gateway/worker-environments/workspace-manifest-worker.ts")
-      : undefined;
+      ? (
+          await importOwner<
+            typeof import("../src/gateway/worker-environments/workspace-manifest-worker.js")
+          >(fixture.source, "src/gateway/worker-environments/workspace-manifest-worker.ts")
+        ).captureWorkspaceManifest
+      : fixture.scenario === "scan"
+        ? (
+            await importOwner<
+              typeof import("../src/gateway/worker-environments/workspace-actual-manifest.js")
+            >(fixture.source, "src/gateway/worker-environments/workspace-actual-manifest.ts")
+          ).readActualWorkspaceManifestImpl
+        : undefined;
   const staging =
     fixture.scenario === "delta" ||
     fixture.scenario === "unchanged" ||
@@ -833,8 +844,8 @@ async function childMain(fixturePath: string, reopening: boolean): Promise<void>
               return digest(bytes);
             };
           }
-          if (manifests) {
-            const result = await manifests.captureWorkspaceManifest({
+          if (captureManifest) {
+            const result = await captureManifest({
               root,
               baseCommit: null,
               signal: AbortSignal.timeout(fixture.timeoutMs),
@@ -1273,7 +1284,7 @@ node --import ./scripts/tsx.mjs scripts/bench-workspace-computation.ts [options]
   --baseline <root>    Optional frozen baseline checkout with ready dependencies
   --candidate <root>   Candidate checkout (default: current directory)
   --source-commit <sha> Archive revision supplied by operator; single candidate only, not independently verified
-  --scenarios <list>   inventory,manifest,delta,unchanged,compare,reconcile,checkpoint,startup,baseline-build (default: all)
+  --scenarios <list>   inventory,manifest,scan,delta,unchanged,compare,reconcile,checkpoint,startup,baseline-build (default: all)
   --sizes <list>       Entries per workspace (default: 1000; max: 100000)
   --concurrency <list> Independent workspaces (default: 1; max: 4)
   --runs <n>           Warm measured samples (default: 3)

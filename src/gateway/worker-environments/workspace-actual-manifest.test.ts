@@ -27,10 +27,14 @@ afterEach(() => {
 
 type InventoryOptions = Parameters<typeof readActualWorkspaceManifestImpl>[0];
 
-async function inventoryFixture(count = 0) {
+async function inventoryFixture(count = 0, directories = false) {
   const root = await fs.realpath(tempDirs.make("workspace-inventory-"));
   const files = Array.from({ length: count }, (_, index) => `file-${index}.txt`);
-  await Promise.all(files.map((file) => fs.writeFile(path.join(root, file), "inside")));
+  await Promise.all(
+    files.map((file) =>
+      directories ? fs.mkdir(path.join(root, file)) : fs.writeFile(path.join(root, file), "inside"),
+    ),
+  );
   const capture = (options: Omit<InventoryOptions, "root" | "baseCommit"> = {}) =>
     readActualWorkspaceManifestImpl({ root, baseCommit: null, ...options });
   return { root, files, capture };
@@ -94,7 +98,7 @@ it.each(["before traversal", "during traversal", "root resolution", "safe-root s
 it.for(["metadata", "walk metadata", "files"] as const)(
   "bounds pending promise resources while %s operations are blocked",
   async (phase, { signal }) => {
-    const { root, files, capture } = await inventoryFixture(512);
+    const { root, files, capture } = await inventoryFixture(512, phase === "walk metadata");
     const gate = createDeferred();
     const allStarted = createDeferred();
     let started = 0;
@@ -145,7 +149,8 @@ it.for(["metadata", "walk metadata", "files"] as const)(
       gate.resolve();
       await Promise.allSettled([scan]);
     }
-    expect((await scan).manifest.entries).toHaveLength(files.length);
+    const { entries, directories } = (await scan).manifest;
+    expect(entries.length + (directories?.length ?? 0)).toBe(files.length);
   },
 );
 
@@ -185,7 +190,10 @@ it.each(fileFailures)(
       }
       return handle;
     });
-    const selection = { includePaths: new Set(files), signal: controller.signal };
+    const selection = {
+      ...(unchangedProbe ? { includePaths: new Set(files) } : {}),
+      signal: controller.signal,
+    };
     const scan = scanActualWorkspaceManifest({
       root,
       baseCommit: null,
@@ -288,7 +296,7 @@ const metadataFailures = [
 it.each(metadataFailures)("settles metadata after %s", async (failure) => {
   const walk = failure.startsWith("walk ");
   const metadataError = failure === "metadata error" || failure === "walk metadata error";
-  const { root, files, capture } = await inventoryFixture(9);
+  const { root, files, capture } = await inventoryFixture(9, walk);
   const lstat = fs.lstat.bind(fs);
   const gates: Array<ReturnType<typeof createDeferred<void>>> = [];
   const failed = createDeferred();
@@ -475,7 +483,12 @@ it("opens only changed file content while retaining fresh edits and deletions", 
   const { root, files, capture } = await inventoryFixture(3);
   const memo = new Map<string, string>();
   const read = () => withWorkspaceHashMemo(memo, () => capture());
+  const metadata = vi.spyOn(fs, "lstat");
   const first = await read();
+  expect(first.manifest.entries).toEqual(files.map((file) => workspaceFile(file, "inside")));
+  expect(metadata.mock.calls.filter(([file]) => String(file).startsWith(root + path.sep))).toEqual(
+    [],
+  );
   const changed = path.join(root, files[1]!);
   const before = await fs.stat(changed);
   await fs.writeFile(changed, "edited");

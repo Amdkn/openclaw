@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants, realpathSync, type BigIntStats } from "node:fs";
+import { constants, realpathSync, type BigIntStats, type Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readFileWindowFully } from "@openclaw/fs-safe/advanced";
@@ -281,6 +281,7 @@ export async function scanActualWorkspaceManifest(
   };
   const filePaths: string[] = [];
   const hashContext = activeWorkspaceHashContext();
+  const freshCapture = !params.reuseFile && !hashContext?.memo.size && !params.unchangedProbe;
   const scanConcurrency = 4;
   const discoveryBatchSize = 32;
   // Nested discovery batches must not replace their first failure with a later caller abort.
@@ -429,13 +430,20 @@ export async function scanActualWorkspaceManifest(
     const absoluteDirectory = relativeDirectory ? path.join(root, relativeDirectory) : root;
     let hasDerivedEntry = false;
     let hasNonDerivedEntry = false;
-    const batch: string[] = [];
+    const batch: Dirent[] = [];
     const scanBatch = async () => {
       const directories: Array<string | undefined> = [];
       await runScans(0, batch.length, async (index) => {
-        const relative = batch[index]!;
+        const entry = batch[index]!;
+        const relative = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
         if (await isExcluded(relative)) {
           hasDerivedEntry = true;
+          return;
+        }
+        if (freshCapture && entry.isFile()) {
+          // The opened-file reader owns type, containment, identity, and byte limits.
+          hasNonDerivedEntry = true;
+          filePaths.push(relative);
           return;
         }
         const absolute = path.join(root, relative);
@@ -471,7 +479,7 @@ export async function scanActualWorkspaceManifest(
       if (!relativeDirectory && name === ".git") {
         continue;
       }
-      batch.push(relative);
+      batch.push(directoryEntry);
       if (batch.length === discoveryBatchSize) {
         await scanBatch();
       }
